@@ -62,6 +62,71 @@
     pointer-events:none;
   }
 
+  /* ===== Side scroll progress rail ===== */
+  .scroll-rail{
+    position:fixed;
+    right:18px;
+    top:50%;
+    transform:translateY(-50%);
+    z-index:60;
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    gap:8px;
+    pointer-events:none;
+    opacity:0;
+    transition:opacity 0.4s ease;
+  }
+  .scroll-rail.visible{opacity:1;}
+  .scroll-rail-track{
+    position:relative;
+    width:4px;
+    height:min(260px, 38vh);
+    border-radius:999px;
+    background:rgba(11,11,20,0.08);
+    overflow:visible;
+  }
+  .scroll-rail-fill{
+    position:absolute;
+    left:0; bottom:0;
+    width:100%;
+    height:0%;
+    border-radius:999px;
+    background:linear-gradient(180deg, var(--cyan), var(--violet) 55%, var(--indigo));
+    box-shadow:0 0 10px rgba(91,95,239,0.45);
+    transition:height 0.12s linear;
+  }
+  .scroll-rail-dot{
+    position:absolute;
+    left:50%;
+    bottom:0%;
+    width:11px; height:11px;
+    border-radius:50%;
+    background:var(--white);
+    border:2.5px solid var(--violet);
+    box-shadow:0 0 0 4px rgba(168,85,247,0.14), 0 4px 10px -2px rgba(91,95,239,0.4);
+    transform:translate(-50%, 50%);
+    transition:bottom 0.12s linear;
+  }
+  .scroll-rail-pct{
+    font-family:var(--ff-mono);
+    font-size:10.5px;
+    font-weight:700;
+    color:var(--ink-faint);
+    letter-spacing:0.02em;
+    min-width:30px;
+    text-align:center;
+  }
+  @media (max-width:640px){
+    .scroll-rail{right:10px; gap:6px;}
+    .scroll-rail-track{height:min(180px, 30vh); width:3px;}
+    .scroll-rail-pct{font-size:9.5px;}
+    .scroll-rail-dot{width:9px; height:9px;}
+  }
+  @media (prefers-reduced-motion: reduce){
+    .scroll-rail-fill, .scroll-rail-dot{transition:none;}
+  }
+
   /* ===== Layout shell ===== */
   .wrap{
     position:relative;
@@ -909,6 +974,14 @@
 
 <canvas id="beam-canvas"></canvas>
 
+<div class="scroll-rail" id="scroll-rail" aria-hidden="true">
+  <div class="scroll-rail-track">
+    <div class="scroll-rail-fill" id="scroll-rail-fill"></div>
+    <div class="scroll-rail-dot" id="scroll-rail-dot"></div>
+  </div>
+  <div class="scroll-rail-pct" id="scroll-rail-pct">0%</div>
+</div>
+
 <nav>
   <div class="nav-inner">
     <div class="brand"><span class="brand-dot"></span> Light the Screen</div>
@@ -967,7 +1040,7 @@
   <section id="showcase">
     <div class="section-head">
       <div class="section-tag">The Wishlist Item</div>
-      <div class="section-title">What we're raising for</div>
+      <div class="section-title">What I'm raising for</div>
     </div>
 
     <div class="showcase">
@@ -1184,109 +1257,281 @@ const io = new IntersectionObserver((entries) => {
 }, { threshold: 0.15 });
 revealEls.forEach(el => io.observe(el));
 
-/* ============ INTERACTIVE BACKGROUND: PROJECTOR DUST BEAM ============ */
+/* ============ SIDE SCROLL PROGRESS RAIL ============ */
+(function(){
+  const rail = document.getElementById('scroll-rail');
+  const fill = document.getElementById('scroll-rail-fill');
+  const dot = document.getElementById('scroll-rail-dot');
+  const pctLabel = document.getElementById('scroll-rail-pct');
+  let ticking = false;
+
+  function updateRail(){
+    const doc = document.documentElement;
+    const scrollTop = window.scrollY || doc.scrollTop;
+    const scrollHeight = doc.scrollHeight - doc.clientHeight;
+    const pct = scrollHeight > 0 ? Math.min(100, Math.max(0, (scrollTop / scrollHeight) * 100)) : 0;
+
+    fill.style.height = pct + '%';
+    dot.style.bottom = pct + '%';
+    pctLabel.textContent = Math.round(pct) + '%';
+
+    // fade in only once the page has been scrolled a little, fade out near the very top
+    if(scrollTop > 24){
+      rail.classList.add('visible');
+    } else {
+      rail.classList.remove('visible');
+    }
+    ticking = false;
+  }
+
+  function onScroll(){
+    if(!ticking){
+      requestAnimationFrame(updateRail);
+      ticking = true;
+    }
+  }
+
+  window.addEventListener('scroll', onScroll, { passive:true });
+  window.addEventListener('resize', onScroll, { passive:true });
+  updateRail();
+})();
+
+/* ============ INTERACTIVE BACKGROUND: WATER RIPPLE FIELD ============ */
 (function(){
   const canvas = document.getElementById('beam-canvas');
-  const ctx = canvas.getContext('2d');
-  let w, h, dpr;
-  let particles = [];
-  let mouse = { x: null, y: null, active:false };
   const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const gl = canvas.getContext('webgl', { alpha:true, premultipliedAlpha:false, antialias:true })
+          || canvas.getContext('experimental-webgl', { alpha:true, premultipliedAlpha:false });
 
+  if(!gl){
+    // graceful fallback: static gradient wash, no WebGL support
+    canvas.style.background = 'radial-gradient(ellipse 80% 50% at 30% 20%, rgba(91,95,239,0.08), transparent), radial-gradient(ellipse 70% 50% at 80% 70%, rgba(168,85,247,0.08), transparent)';
+    return;
+  }
+
+  const vsSource = `
+    attribute vec2 a_pos;
+    void main(){ gl_Position = vec4(a_pos, 0.0, 1.0); }
+  `;
+
+  // Fragment shader: layered sine ripples emanating from up to 8 active
+  // touch points (cursor trail + click pulses), shaded with the site's
+  // indigo / violet / cyan palette, composited over transparency so the
+  // page's own light gradient background shows through.
+  const fsSource = `
+    precision highp float;
+    uniform vec2 u_resolution;
+    uniform float u_time;
+    uniform vec4 u_ripples[8];   // x, y (px), startTime, strength
+    uniform int u_rippleCount;
+    uniform vec2 u_mouse;
+    uniform float u_mouseActive;
+
+    vec3 palette(float t){
+      vec3 indigo = vec3(91.0,95.0,239.0)/255.0;
+      vec3 violet = vec3(168.0,85.0,247.0)/255.0;
+      vec3 cyan   = vec3(0.0,217.0,255.0)/255.0;
+      t = fract(t);
+      if(t < 0.5){
+        return mix(indigo, violet, smoothstep(0.0,1.0,t*2.0));
+      } else {
+        return mix(violet, cyan, smoothstep(0.0,1.0,(t-0.5)*2.0));
+      }
+    }
+
+    void main(){
+      vec2 uv = gl_FragCoord.xy;
+      vec2 st = gl_FragCoord.xy / u_resolution.xy;
+
+      float totalHeight = 0.0;
+      float colorMix = 0.0;
+      float weightSum = 0.0001;
+
+      for(int i = 0; i < 8; i++){
+        if(i >= u_rippleCount) break;
+        vec4 r = u_ripples[i];
+        vec2 center = r.xy;
+        float age = u_time - r.z;
+        float strength = r.w;
+        if(age < 0.0 || age > 3.2) continue;
+
+        float dist = distance(uv, center);
+        float waveFront = age * 340.0;
+        float band = dist - waveFront;
+
+        float ring = exp(-abs(band) * 0.020) * exp(-age * 0.9);
+        float ripple = sin(band * 0.06 - age * 4.0) * ring;
+
+        totalHeight += ripple * strength;
+        colorMix += (dist * 0.0026 + age * 0.35) * ring * strength;
+        weightSum += ring * strength;
+      }
+
+      float hue = colorMix / weightSum + u_time * 0.015;
+      vec3 col = palette(hue);
+
+      // ambient slow drifting gradient wash so it never looks static
+      float ambient = sin(st.x * 3.0 + u_time * 0.05) * cos(st.y * 2.4 - u_time * 0.04) * 0.5 + 0.5;
+      vec3 ambientCol = palette(ambient * 0.3 + u_time * 0.01);
+
+      float intensity = clamp(abs(totalHeight) * 1.4, 0.0, 1.0);
+      vec3 finalCol = mix(ambientCol, col, intensity);
+
+      float alpha = clamp(intensity * 0.55 + ambient * 0.035, 0.0, 0.34);
+
+      // soft cursor glow even without a ripple pulse
+      if(u_mouseActive > 0.5){
+        float md = distance(uv, u_mouse);
+        float glow = exp(-md * 0.012) * 0.18;
+        finalCol = mix(finalCol, palette(u_time*0.02 + 0.5), glow * 0.6);
+        alpha += glow;
+      }
+
+      gl_FragColor = vec4(finalCol, alpha);
+    }
+  `;
+
+  function compile(type, src){
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+      console.warn('Shader compile error:', gl.getShaderInfoLog(s));
+      gl.deleteShader(s);
+      return null;
+    }
+    return s;
+  }
+
+  const vs = compile(gl.VERTEX_SHADER, vsSource);
+  const fs = compile(gl.FRAGMENT_SHADER, fsSource);
+  if(!vs || !fs){ return; }
+
+  const program = gl.createProgram();
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  if(!gl.getProgramParameter(program, gl.LINK_STATUS)){
+    console.warn('Program link error:', gl.getProgramInfoLog(program));
+    return;
+  }
+  gl.useProgram(program);
+
+  const quad = new Float32Array([-1,-1, 1,-1, -1,1, 1,1]);
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+  const posLoc = gl.getAttribLocation(program, 'a_pos');
+  gl.enableVertexAttribArray(posLoc);
+  gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
+
+  const u_resolution = gl.getUniformLocation(program, 'u_resolution');
+  const u_time = gl.getUniformLocation(program, 'u_time');
+  const u_ripples = gl.getUniformLocation(program, 'u_ripples');
+  const u_rippleCount = gl.getUniformLocation(program, 'u_rippleCount');
+  const u_mouse = gl.getUniformLocation(program, 'u_mouse');
+  const u_mouseActive = gl.getUniformLocation(program, 'u_mouseActive');
+
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+  let dpr = Math.min(window.devicePixelRatio || 1, 2);
+  let w, h;
   function resize(){
     dpr = Math.min(window.devicePixelRatio || 1, 2);
     w = window.innerWidth;
     h = window.innerHeight;
-    canvas.width = w * dpr;
-    canvas.height = h * dpr;
+    canvas.width = Math.floor(w * dpr);
+    canvas.height = Math.floor(h * dpr);
     canvas.style.width = w + 'px';
     canvas.style.height = h + 'px';
-    ctx.setTransform(dpr,0,0,dpr,0,0);
+    gl.viewport(0, 0, canvas.width, canvas.height);
   }
   resize();
   window.addEventListener('resize', resize);
 
-  const COLORS = ['91,95,239', '168,85,247', '0,217,255'];
-  const COUNT = Math.min(70, Math.floor((window.innerWidth * window.innerHeight) / 16000));
+  // ripple pool: { x, y, startTime, strength }
+  const MAX_RIPPLES = 8;
+  let ripples = [];
+  let startClock = performance.now();
+  function clockNow(){ return (performance.now() - startClock) / 1000; }
 
-  function makeParticle(){
-    return {
-      x: Math.random() * w,
-      y: Math.random() * h,
-      r: Math.random() * 2.2 + 0.6,
-      baseR: 0,
-      vx: (Math.random() - 0.5) * 0.18,
-      vy: (Math.random() - 0.5) * 0.18,
-      color: COLORS[Math.floor(Math.random() * COLORS.length)],
-      alpha: Math.random() * 0.35 + 0.12,
-      twinkleSpeed: Math.random() * 0.015 + 0.005,
-      twinklePhase: Math.random() * Math.PI * 2
-    };
+  function pushRipple(clientX, clientY, strength){
+    const x = clientX * dpr;
+    const y = (h - clientY) * dpr; // flip Y for GL coords
+    ripples.push({ x, y, t: clockNow(), strength });
+    if(ripples.length > MAX_RIPPLES) ripples.shift();
   }
-  particles = Array.from({length: COUNT}, makeParticle);
-  particles.forEach(p => p.baseR = p.r);
+
+  let lastMoveEmit = 0;
+  let mouse = { x: -9999, y: -9999, active: false };
 
   function onPointerMove(e){
     const x = e.touches ? e.touches[0].clientX : e.clientX;
     const y = e.touches ? e.touches[0].clientY : e.clientY;
-    mouse.x = x; mouse.y = y; mouse.active = true;
+    mouse.x = x * dpr;
+    mouse.y = (h - y) * dpr;
+    mouse.active = true;
+
+    const now = performance.now();
+    if(now - lastMoveEmit > 70){
+      pushRipple(x, y, 0.55);
+      lastMoveEmit = now;
+    }
+  }
+  function onPointerDown(e){
+    const x = e.touches ? e.touches[0].clientX : e.clientX;
+    const y = e.touches ? e.touches[0].clientY : e.clientY;
+    pushRipple(x, y, 1.6);
   }
   window.addEventListener('mousemove', onPointerMove, { passive:true });
   window.addEventListener('touchmove', onPointerMove, { passive:true });
+  window.addEventListener('mousedown', onPointerDown, { passive:true });
+  window.addEventListener('touchstart', onPointerDown, { passive:true });
   window.addEventListener('mouseleave', () => { mouse.active = false; });
 
-  let t = 0;
-  function draw(){
-    ctx.clearRect(0,0,w,h);
-    t += 1;
+  // gentle ambient auto-ripples so the field feels alive before any interaction
+  function ambientPulse(){
+    if(document.hidden) return;
+    const x = Math.random() * w;
+    const y = Math.random() * h;
+    pushRipple(x, y, 0.4);
+  }
+  let ambientInterval = setInterval(ambientPulse, 4200);
 
-    for(const p of particles){
-      // gentle ambient drift
-      p.x += p.vx;
-      p.y += p.vy;
+  function render(){
+    const now = clockNow();
+    ripples = ripples.filter(r => (now - r.t) < 3.2);
 
-      // wrap around edges
-      if(p.x < -10) p.x = w + 10;
-      if(p.x > w + 10) p.x = -10;
-      if(p.y < -10) p.y = h + 10;
-      if(p.y > h + 10) p.y = -10;
+    gl.uniform2f(u_resolution, canvas.width, canvas.height);
+    gl.uniform1f(u_time, now);
+    gl.uniform1i(u_rippleCount, Math.min(ripples.length, MAX_RIPPLES));
+    gl.uniform2f(u_mouse, mouse.active ? mouse.x : -9999, mouse.active ? mouse.y : -9999);
+    gl.uniform1f(u_mouseActive, mouse.active ? 1.0 : 0.0);
 
-      // cursor interaction: gentle repel + glow boost within radius
-      let r = p.baseR;
-      let alpha = p.alpha + Math.sin(t * p.twinkleSpeed + p.twinklePhase) * 0.08;
-
-      if(mouse.active){
-        const dx = p.x - mouse.x;
-        const dy = p.y - mouse.y;
-        const dist = Math.sqrt(dx*dx + dy*dy);
-        const radius = 160;
-        if(dist < radius){
-          const force = (1 - dist / radius);
-          const angle = Math.atan2(dy, dx);
-          p.x += Math.cos(angle) * force * 1.6;
-          p.y += Math.sin(angle) * force * 1.6;
-          r = p.baseR + force * 3.2;
-          alpha = Math.min(0.85, alpha + force * 0.55);
-        }
-      }
-
-      ctx.beginPath();
-      ctx.fillStyle = `rgba(${p.color}, ${Math.max(0, alpha)})`;
-      ctx.shadowColor = `rgba(${p.color}, 0.8)`;
-      ctx.shadowBlur = r * 3;
-      ctx.arc(p.x, p.y, Math.max(0.3, r), 0, Math.PI * 2);
-      ctx.fill();
+    const flat = new Float32Array(MAX_RIPPLES * 4);
+    for(let i = 0; i < ripples.length; i++){
+      const r = ripples[i];
+      flat[i*4+0] = r.x;
+      flat[i*4+1] = r.y;
+      flat[i*4+2] = r.t;
+      flat[i*4+3] = r.strength;
     }
+    gl.uniform4fv(u_ripples, flat);
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 
     if(!reduceMotion){
-      requestAnimationFrame(draw);
+      requestAnimationFrame(render);
     }
   }
 
   if(reduceMotion){
-    draw(); // single static frame
+    // single calm frame, no animation loop, no ambient pulses
+    clearInterval(ambientInterval);
+    render();
   } else {
-    requestAnimationFrame(draw);
+    requestAnimationFrame(render);
   }
 })();
 </script>
